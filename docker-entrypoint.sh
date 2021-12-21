@@ -5,7 +5,10 @@ shopt -s nullglob
 # logging functions
 mysql_log() {
 	local type="$1"; shift
-	printf '%s [%s] [Entrypoint]: %s\n' "$(date --rfc-3339=seconds)" "$type" "$*"
+	# accept argument string or stdin
+	local text="$*"; if [ "$#" -eq 0 ]; then text="$(cat)"; fi
+	local dt; dt="$(date --rfc-3339=seconds)"
+	printf '%s [%s] [Entrypoint]: %s\n' "$dt" "$type" "$text"
 }
 mysql_note() {
 	mysql_log Note "$@"
@@ -78,8 +81,14 @@ docker_process_init_files() {
 	done
 }
 
+# arguments necessary to run "mysqld --verbose --help" successfully (used for testing configuration validity and for extracting default/configured values)
+_verboseHelpArgs=(
+	--verbose --help
+	--log-bin-index="$(mktemp -u)" # https://github.com/docker-library/mysql/issues/136
+)
+
 mysql_check_config() {
-	local toRun=( "$@" --verbose --help ) errors
+	local toRun=( "$@" "${_verboseHelpArgs[@]}" ) errors
 	if ! errors="$("${toRun[@]}" 2>&1 >/dev/null)"; then
 		mysql_error $'mysqld failed while attempting to check config\n\tcommand was: '"${toRun[*]}"$'\n\t'"$errors"
 	fi
@@ -90,7 +99,7 @@ mysql_check_config() {
 # latter only show values present in config files, and not server defaults
 mysql_get_config() {
 	local conf="$1"; shift
-	"$@" --verbose --help --log-bin-index="$(mktemp -u)" 2>/dev/null \
+	"$@" "${_verboseHelpArgs[@]}" 2>/dev/null \
 		| awk -v conf="$conf" '$1 == conf && /^[^ \t]/ { sub(/^[^ \t]+[ \t]+/, ""); print; exit }'
 	# match "datadir      /some/path with/spaces in/it here" but not "--xyz=abc\n     datadir (xyz)"
 }
@@ -98,11 +107,11 @@ mysql_get_config() {
 # Do a temporary startup of the MySQL server, for init purposes
 docker_temp_server_start() {
 	if [ "${MYSQL_MAJOR}" = '5.6' ] || [ "${MYSQL_MAJOR}" = '5.7' ]; then
-		"$@" --skip-networking --socket="${SOCKET}" &
+		"$@" --skip-networking --default-time-zone=SYSTEM --socket="${SOCKET}" &
 		mysql_note "Waiting for server startup"
 		local i
 		for i in {30..0}; do
-			# only use the root password if the database has already been initializaed
+			# only use the root password if the database has already been initialized
 			# so that it won't try to fill in a password file when it hasn't been set yet
 			extraArgs=()
 			if [ -z "$DATABASE_ALREADY_EXISTS" ]; then
@@ -118,7 +127,7 @@ docker_temp_server_start() {
 		fi
 	else
 		# For 5.7+ the server is ready for use as soon as startup command unblocks
-		if ! "$@" --daemonize --skip-networking --socket="${SOCKET}"; then
+		if ! "$@" --daemonize --skip-networking --default-time-zone=SYSTEM --socket="${SOCKET}"; then
 			mysql_error "Unable to start server."
 		fi
 	fi
@@ -135,7 +144,31 @@ docker_temp_server_stop() {
 # Verify that the minimally required password settings are set for new databases.
 docker_verify_minimum_env() {
 	if [ -z "$MYSQL_ROOT_PASSWORD" -a -z "$MYSQL_ALLOW_EMPTY_PASSWORD" -a -z "$MYSQL_RANDOM_ROOT_PASSWORD" ]; then
-		mysql_error $'Database is uninitialized and password option is not specified\n\tYou need to specify one of MYSQL_ROOT_PASSWORD, MYSQL_ALLOW_EMPTY_PASSWORD and MYSQL_RANDOM_ROOT_PASSWORD'
+		mysql_error <<-'EOF'
+			Database is uninitialized and password option is not specified
+			    You need to specify one of the following:
+			    - MYSQL_ROOT_PASSWORD
+			    - MYSQL_ALLOW_EMPTY_PASSWORD
+			    - MYSQL_RANDOM_ROOT_PASSWORD
+		EOF
+	fi
+
+	# This will prevent the CREATE USER from failing (and thus exiting with a half-initialized database)
+	if [ "$MYSQL_USER" = 'root' ]; then
+		mysql_error <<-'EOF'
+			MYSQL_USER="root", MYSQL_USER and MYSQL_PASSWORD are for configuring a regular user and cannot be used for the root user
+			    Remove MYSQL_USER="root" and use one of the following to control the root user password:
+			    - MYSQL_ROOT_PASSWORD
+			    - MYSQL_ALLOW_EMPTY_PASSWORD
+			    - MYSQL_RANDOM_ROOT_PASSWORD
+		EOF
+	fi
+
+	# warn when missing one of MYSQL_USER or MYSQL_PASSWORD
+	if [ -n "$MYSQL_USER" ] && [ -z "$MYSQL_PASSWORD" ]; then
+		mysql_warn 'MYSQL_USER specified, but missing MYSQL_PASSWORD; MYSQL_USER will not be created'
+	elif [ -z "$MYSQL_USER" ] && [ -n "$MYSQL_PASSWORD" ]; then
+		mysql_warn 'MYSQL_PASSWORD specified, but missing MYSQL_USER; MYSQL_PASSWORD will be ignored'
 	fi
 }
 
@@ -158,9 +191,9 @@ docker_create_db_directories() {
 docker_init_database_dir() {
 	mysql_note "Initializing database files"
 	if [ "$MYSQL_MAJOR" = '5.6' ]; then
-		mysql_install_db --datadir="$DATADIR" --rpm --keep-my-cnf "${@:2}"
+		mysql_install_db --datadir="$DATADIR" --rpm --keep-my-cnf "${@:2}" --default-time-zone=SYSTEM
 	else
-		"$@" --initialize-insecure
+		"$@" --initialize-insecure --default-time-zone=SYSTEM
 	fi
 	mysql_note "Database files initialized"
 
@@ -208,7 +241,7 @@ docker_process_sql() {
 		set -- --database="$MYSQL_DATABASE" "$@"
 	fi
 
-	mysql --defaults-extra-file=<( _mysql_passfile "${passfileArgs[@]}") --protocol=socket -uroot -hlocalhost --socket="${SOCKET}" "$@"
+	mysql --defaults-extra-file=<( _mysql_passfile "${passfileArgs[@]}") --protocol=socket -uroot -hlocalhost --socket="${SOCKET}" --comments "$@"
 }
 
 # Initializes database with timezone info and root password, plus optional extra db/user
@@ -286,8 +319,6 @@ docker_setup_db() {
 			mysql_note "Giving user ${MYSQL_USER} access to schema ${MYSQL_DATABASE}"
 			docker_process_sql --database=mysql <<<"GRANT ALL ON \`${MYSQL_DATABASE//_/\\_}\`.* TO '$MYSQL_USER'@'%' ;"
 		fi
-
-		docker_process_sql --database=mysql <<<"FLUSH PRIVILEGES ;"
 	fi
 }
 
